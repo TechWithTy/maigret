@@ -4,8 +4,10 @@ Maigret main module
 
 import ast
 import asyncio
+import aiohttp
 import logging
 import os
+import aiofiles.os
 import sys
 import platform
 import re
@@ -13,7 +15,7 @@ from argparse import ArgumentParser, RawDescriptionHelpFormatter
 from typing import List, Tuple
 import os.path as path
 
-from socid_extractor import extract, parse
+from socid_extractor import extract
 
 from .__version__ import __version__
 from .checking import (
@@ -46,7 +48,7 @@ from .settings import Settings
 from .permutator import Permute
 
 
-def extract_ids_from_page(url, logger, timeout=5) -> dict:
+async def extract_ids_from_page(url, logger, timeout=5) -> dict:
     results = {}
     # url, headers
     reqs: List[Tuple[str, set]] = [(url, set())]
@@ -58,30 +60,35 @@ def extract_ids_from_page(url, logger, timeout=5) -> dict:
     except Exception as e:
         logger.warning(e)
 
-    for req in reqs:
-        url, headers = req
-        print(f'Scanning webpage by URL {url}...')
-        page, _ = parse(url, cookies_str='', headers=headers, timeout=timeout)
-        logger.debug(page)
-        info = extract(page)
-        if not info:
-            print('Nothing extracted')
-        else:
-            print(get_dict_ascii_tree(info.items(), new_line=False), ' ')
-        for k, v in info.items():
-            # TODO: merge with the same functionality in checking module
-            if 'username' in k and not 'usernames' in k:
-                results[v] = 'username'
-            elif 'usernames' in k:
-                try:
-                    tree = ast.literal_eval(v)
-                    if type(tree) == list:
-                        for n in tree:
-                            results[n] = 'username'
-                except Exception as e:
-                    logger.warning(e)
-            if k in SUPPORTED_IDS:
-                results[v] = k
+    async with aiohttp.ClientSession() as session:
+        for req in reqs:
+            url, headers = req
+            print(f'Scanning webpage by URL {url}...')
+            try:
+                async with session.get(url, headers=headers, timeout=timeout) as response:
+                    page = await response.text()
+                    logger.debug(page)
+                    info = extract(page)
+                    if not info:
+                        print('Nothing extracted')
+                    else:
+                        print(get_dict_ascii_tree(info.items(), new_line=False), ' ')
+                    for k, v in info.items():
+                        # TODO: merge with the same functionality in checking module
+                        if 'username' in k and not 'usernames' in k:
+                            results[v] = 'username'
+                        elif 'usernames' in k:
+                            try:
+                                tree = ast.literal_eval(v)
+                                if type(tree) == list:
+                                    for n in tree:
+                                        results[n] = 'username'
+                            except Exception as e:
+                                logger.warning(e)
+                        if k in SUPPORTED_IDS:
+                            results[v] = k
+            except Exception as e:
+                logger.warning(f"An error occurred while fetching {url}: {e}")
 
     return results
 
@@ -475,7 +482,7 @@ async def main():
 
     # Load settings
     settings = Settings()
-    settings_loaded, err = settings.load()
+    settings_loaded, err = await settings.load()
 
     if not settings_loaded:
         logger.error(err)
@@ -502,7 +509,7 @@ async def main():
     original_usernames = ""
     if args.permute and len(usernames) > 1 and args.id_type == 'username':
         original_usernames = " ".join(usernames.keys())
-        usernames = Permute(usernames).gather(method='strict')
+        usernames = await Permute(usernames).gather(method='strict')
 
     parsing_enabled = not args.disable_extracting
     recursive_search_enabled = not args.disable_recursive_search
@@ -512,7 +519,7 @@ async def main():
         print("Using the proxy: " + args.proxy)
 
     if args.parse_url:
-        extracted_ids = extract_ids_from_page(
+        extracted_ids = await extract_ids_from_page(
             args.parse_url, logger, timeout=args.timeout
         )
         usernames.update(extracted_ids)
@@ -537,7 +544,7 @@ async def main():
     )
 
     # Create object with all information about sites we are aware of.
-    db = MaigretDatabase().load_from_path(db_file)
+    db = await MaigretDatabase().load_from_path(db_file)
     get_top_sites_for_id = lambda x: db.ranked_sites_dict(
         top=args.top_sites,
         tags=args.tags,
@@ -552,7 +559,7 @@ async def main():
         submitter = Submitter(db=db, logger=logger, settings=settings, args=args)
         is_submitted = await submitter.dialog(args.new_site_to_submit, args.cookie_file)
         if is_submitted:
-            db.save_to_file(db_file)
+            await db.save_to_file(db_file)
         await submitter.close()
 
     # Database self-checking
@@ -580,7 +587,7 @@ async def main():
                 'y',
                 '',
             ):
-                db.save_to_file(db_file)
+                await db.save_to_file(db_file)
                 print('Database was successfully updated.')
             else:
                 print('Updates will be applied only for current search session.')
@@ -597,7 +604,7 @@ async def main():
     report_dir = path.join(os.getcwd(), args.folderoutput)
 
     # Make reports folder is not exists
-    os.makedirs(report_dir, exist_ok=True)
+    await aiofiles.os.makedirs(report_dir, exist_ok=True)
 
     # Define one report filename template
     report_filepath_tpl = path.join(report_dir, 'report_{username}{postfix}')
@@ -709,19 +716,19 @@ async def main():
         if args.xmind:
             username = username.replace('/', '_')
             filename = report_filepath_tpl.format(username=username, postfix='.xmind')
-            save_xmind_report(filename, username, results)
+            await save_xmind_report(filename, username, results)
             query_notify.warning(f'XMind report for {username} saved in {filename}')
 
         if args.csv:
             username = username.replace('/', '_')
             filename = report_filepath_tpl.format(username=username, postfix='.csv')
-            save_csv_report(filename, username, results)
+            await save_csv_report(filename, username, results)
             query_notify.warning(f'CSV report for {username} saved in {filename}')
 
         if args.txt:
             username = username.replace('/', '_')
             filename = report_filepath_tpl.format(username=username, postfix='.txt')
-            save_txt_report(filename, username, results)
+            await save_txt_report(filename, username, results)
             query_notify.warning(f'TXT report for {username} saved in {filename}')
 
         if args.json:
@@ -729,7 +736,7 @@ async def main():
             filename = report_filepath_tpl.format(
                 username=username, postfix=f'_{args.json}.json'
             )
-            save_json_report(filename, username, results, report_type=args.json)
+            await save_json_report(filename, username, results, report_type=args.json)
             query_notify.warning(
                 f'JSON {args.json} report for {username} saved in {filename}'
             )
@@ -747,13 +754,13 @@ async def main():
             filename = report_filepath_tpl.format(
                 username=username, postfix='_plain.html'
             )
-            save_html_report(filename, report_context)
+            await save_html_report(filename, report_context)
             query_notify.warning(f'HTML report on all usernames saved in {filename}')
 
         if args.pdf:
             username = username.replace('/', '_')
             filename = report_filepath_tpl.format(username=username, postfix='.pdf')
-            save_pdf_report(filename, report_context)
+            await save_pdf_report(filename, report_context)
             query_notify.warning(f'PDF report on all usernames saved in {filename}')
 
         if args.graph:
@@ -761,7 +768,7 @@ async def main():
             filename = report_filepath_tpl.format(
                 username=username, postfix='_graph.html'
             )
-            save_graph_report(filename, general_results, db)
+            await save_graph_report(filename, general_results, db)
             query_notify.warning(f'Graph report on all usernames saved in {filename}')
 
         text_report = get_plaintext_report(report_context)
@@ -770,16 +777,12 @@ async def main():
             print(text_report)
 
     # update database
-    db.save_to_file(db_file)
+    await db.save_to_file(db_file)
 
 
 def run():
     try:
-        if sys.version_info.minor >= 10:
-            asyncio.run(main())
-        else:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print('Maigret is interrupted.')
         sys.exit(1)

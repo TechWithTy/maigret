@@ -1,5 +1,4 @@
 # Standard library imports
-import ast
 import asyncio
 import logging
 import random
@@ -9,13 +8,13 @@ import sys
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+
 # Third party imports
 import aiodns
-from alive_progress import alive_bar
 from aiohttp import ClientSession, TCPConnector, http_exceptions
 from aiohttp.client_exceptions import ClientConnectorError, ServerDisconnectedError
+from alive_progress import alive_bar
 from python_socks import _errors as proxy_errors
-from socid_extractor import extract
 
 try:
     from mock import Mock
@@ -27,10 +26,15 @@ from . import errors
 from .activation import ParsingActivator, import_aiohttp_cookies
 from .errors import CheckError
 from .executors import AsyncioQueueGeneratorExecutor
-from .result import MaigretCheckResult, MaigretCheckStatus
-from .sites import MaigretDatabase, MaigretSite
+from .result import MaigretCheckResult, MaigretCheckStatus, MaigretResults
+from .sites import MaigretSite
 from .types import QueryOptions, QueryResultWrapper
-from .utils import ascii_data_display, get_random_user_agent
+from .utils import (
+    extract_ids_data,
+    get_random_user_agent,
+    parse_usernames,
+    update_results_info,
+)
 
 
 SUPPORTED_IDS = (
@@ -62,6 +66,7 @@ class SimpleAiohttpChecker(CheckerBase):
         self.allow_redirects = True
         self.timeout = 0
         self.method = 'get'
+        self.activator = None
 
     def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get'):
         self.url = url
@@ -133,6 +138,7 @@ class SimpleAiohttpChecker(CheckerBase):
             # TODO: tests
             cookie_jar=self.cookie_jar if self.cookie_jar else None,
         ) as session:
+            self.activator = ParsingActivator(session)
             html_text, status_code, error = await self._make_request(
                 session,
                 self.url,
@@ -234,8 +240,8 @@ def debug_response_logging(url, html_text, status_code, check_error):
             f.write(f"code: {status}\nresponse: {str(html_text)}\n")
 
 
-def process_site_result(
-    response, query_notify, logger, results_info: QueryResultWrapper, site: MaigretSite
+async def process_site_result(
+    response, query_notify, logger, results_info: QueryResultWrapper, site: MaigretSite, checker: CheckerBase
 ):
     if not response:
         return results_info
@@ -284,10 +290,10 @@ def process_site_result(
         logger.debug(f"Activation for {site.name}")
         method = site.activation["method"]
         try:
-            activate_fun = getattr(ParsingActivator(), method)
-            # TODO: async call
-            activate_fun(site, logger)
-        except AttributeError as e:
+            activator = checker.activator
+            activate_fun = getattr(activator, method)
+            await activate_fun(site, logger)
+        except AttributeError:
             logger.warning(
                 f"Activation method {method} for site {site.name} not found!",
                 exc_info=True,
@@ -531,9 +537,6 @@ async def check_site_for_username(
     default_result = make_site_result(
         site, username, options, logger, retry=kwargs.get('retry')
     )
-    # future = default_result.get("future")
-    # if not future:
-    # return site.name, default_result
 
     checker = default_result.get("checker")
     if not checker:
@@ -542,23 +545,13 @@ async def check_site_for_username(
 
     response = await checker.check()
 
-    response_result = process_site_result(
-        response, query_notify, logger, default_result, site
+    response_result = await process_site_result(
+        response, query_notify, logger, default_result, site, checker
     )
 
     query_notify.update(response_result['status'], site.similar_search)
 
     return site.name, response_result
-
-
-async def debug_ip_request(checker, logger):
-    checker.prepare(url="https://icanhazip.com")
-    ip, status, check_error = await checker.check()
-    if ip:
-        logger.debug(f"My IP is: {ip.strip()}")
-    else:
-        logger.debug(f"IP requesting {check_error.type}: {check_error.desc}")
-
 
 def get_failed_sites(results: Dict[str, QueryResultWrapper]) -> List[str]:
     sites = []
@@ -576,397 +569,101 @@ async def maigret(
     site_dict: Dict[str, MaigretSite],
     logger,
     query_notify=None,
-    proxy=None,
-    tor_proxy=None,
-    i2p_proxy=None,
-    timeout=3,
-    is_parsing_enabled=False,
-    id_type="username",
-    debug=False,
-    forced=False,
-    max_connections=100,
-    no_progressbar=False,
-    cookies=None,
-    retries=0,
-    check_domains=False,
-    *args,
-    **kwargs,
-) -> QueryResultWrapper:
-    """Main search func
+    **kwargs
+) -> Dict[str, QueryResultWrapper]:
 
-    Checks for existence of username on certain sites.
+    # TODO: add other options
+    options = QueryOptions(
+        username=username,
+        site_dict=site_dict,
+        **kwargs
+    )
 
-    Keyword Arguments:
-    username               -- Username string will be used for search.
-    site_dict              -- Dictionary containing sites data in MaigretSite objects.
-    query_notify           -- Object with base type of QueryNotify().
-                              This will be used to notify the caller about
-                              query results.
-    logger                 -- Standard Python logger object.
-    timeout                -- Time in seconds to wait before timing out request.
-                              Default is 3 seconds.
-    is_parsing_enabled     -- Extract additional info from account pages.
-    id_type                -- Type of username to search.
-                              Default is 'username', see all supported here:
-                              https://maigret.readthedocs.io/en/latest/supported-identifier-types.html
-    max_connections        -- Maximum number of concurrent connections allowed.
-                              Default is 100.
-    no_progressbar         -- Displaying of ASCII progressbar during scanner.
-    cookies                -- Filename of a cookie jar file to use for each request.
-
-    Return Value:
-    Dictionary containing results from report. Key of dictionary is the name
-    of the social network site, and the value is another dictionary with
-    the following keys:
-        url_main:      URL of main site.
-        url_user:      URL of user on site (if account exists).
-        status:        QueryResult() object indicating results of test for
-                       account existence.
-        http_status:   HTTP status code of query which checked for existence on
-                       site.
-        response_text: Text that came back from request.  May be None if
-                       there was an HTTP error when checking for existence.
-    """
-
-    # notify caller that we are starting the query.
     if not query_notify:
-        query_notify = Mock()
-
-    query_notify.start(username, id_type)
-
-    cookie_jar = None
-    if cookies:
-        logger.debug(f"Using cookies jar file {cookies}")
-        cookie_jar = import_aiohttp_cookies(cookies)
-
-    clearweb_checker = SimpleAiohttpChecker(
-        proxy=proxy, cookie_jar=cookie_jar, logger=logger
-    )
-
-    # TODO
-    tor_checker = CheckerMock()
-    if tor_proxy:
-        tor_checker = ProxiedAiohttpChecker(  # type: ignore
-            proxy=tor_proxy, cookie_jar=cookie_jar, logger=logger
+        query_notify = MaigretResults(
+            username=username,
+            known_accounts=[],
+            skipped_sites=[],
         )
 
-    # TODO
-    i2p_checker = CheckerMock()
-    if i2p_proxy:
-        i2p_checker = ProxiedAiohttpChecker(  # type: ignore
-            proxy=i2p_proxy, cookie_jar=cookie_jar, logger=logger
+    # if options['no_recursion']:
+    #     options['parsing'] = False
+
+    # if options['proxy'] and options['proxy'].startswith('tor'):
+    #     logger.info('Using Tor proxy')
+    #     options['tor_proxy'] = options['proxy']
+    #     options['proxy'] = None
+    # elif options['proxy'] and options['proxy'].startswith('i2p'):
+    #     logger.info('Using I2P proxy')
+    #     options['i2p_proxy'] = options['proxy']
+    #     options['proxy'] = None
+
+    # if options['proxy']:
+    #     logger.info(f"Using proxy {options['proxy']}")
+    #     await debug_ip_request(options['checkers']['http'], logger)
+
+    # if options['tor_proxy']:
+    #     await debug_ip_request(options['checkers']['tor'], logger)
+
+    # if options['i2p_proxy']:
+    #     await debug_ip_request(options['checkers']['i2p'], logger)
+
+    # if options['cookies']:
+    #     options['cookie_jar'] = import_aiohttp_cookies(options['cookies'])
+
+    sites_total_count = len(site_dict)
+
+    # Create a progress bar
+    if not options['silent']:
+        query_notify.bar = alive_bar(
+            sites_total_count,
+            title='Searching',
+            force_tty=True,
+            enrich_print=False,
         )
 
-    # TODO
-    dns_checker = CheckerMock()
-    if check_domains:
-        dns_checker = AiodnsDomainResolver(logger=logger)  # type: ignore
+    query_notify.sites_count = sites_total_count
 
-    if logger.level == logging.DEBUG:
-        await debug_ip_request(clearweb_checker, logger)
-
-    # setup parallel executor
+    # TODO: add another executor for retries
     executor = AsyncioQueueGeneratorExecutor(
+        check_site_for_username,
         logger=logger,
-        in_parallel=max_connections,
-        timeout=timeout + 0.5,
-        *args,
-        **kwargs,
+        max_workers=options['max_connections'],
     )
 
-    # make options objects for all the requests
-    options: QueryOptions = {}
-    options["cookies"] = cookie_jar
-    options["checkers"] = {
-        '': clearweb_checker,
-        'tor': tor_checker,
-        'dns': dns_checker,
-        'i2p': i2p_checker,
-    }
-    options["parsing"] = is_parsing_enabled
-    options["timeout"] = timeout
-    options["id_type"] = id_type
-    options["forced"] = forced
+    all_results = {}
 
-    # results from analysis of all sites
-    all_results: Dict[str, QueryResultWrapper] = {}
+    def get_results_from_future(future):
+        name, result = future.result()
+        all_results[name] = result
+        # if not options['silent']:
+        #     query_notify.bar()
 
-    sites = list(site_dict.keys())
+    tasks = []
+    for site in site_dict.values():
+        task = executor.submit(site, username, options, logger, query_notify)
+        task.add_done_callback(get_results_from_future)
+        tasks.append(task)
 
-    attempts = retries + 1
-    while attempts:
-        tasks_dict = {}
+    await asyncio.gather(*tasks)
 
-        for sitename, site in site_dict.items():
-            if sitename not in sites:
-                continue
-            default_result: QueryResultWrapper = {
-                'site': site,
-                'status': MaigretCheckResult(
-                    username,
-                    sitename,
-                    '',
-                    MaigretCheckStatus.UNKNOWN,
-                    error=CheckError('Request failed'),
-                ),
-            }
-            tasks_dict[sitename] = (
-                check_site_for_username,
-                [site, username, options, logger, query_notify],
-                {
-                    'default': (sitename, default_result),
-                    'retry': retries - attempts + 1,
-                },
-            )
+    # if options['retries'] > 0:
+    #     failed_sites = get_failed_sites(all_results)
+    #     retries_count = options['retries']
+    #     logger.info(f'Retrying {len(failed_sites)} sites, {retries_count} retries left')
+    #     options['retries'] = retries_count - 1
+    #     retry_results = await maigret(
+    #         username=username,
+    #         site_dict={k:v for k,v in site_dict.items() if k in failed_sites},
+    #         logger=logger,
+    #         query_notify=query_notify,
+    #         **options
+    #     )
+    #     all_results.update(retry_results)
 
-        cur_results = []
-        with alive_bar(
-            len(tasks_dict), title="Searching", force_tty=True, disable=no_progressbar
-        ) as progress:
-            async for result in executor.run(tasks_dict.values()):
-                cur_results.append(result)
-                progress()
-
-        all_results.update(cur_results)
-
-        # rerun for failed sites
-        sites = get_failed_sites(dict(cur_results))
-        attempts -= 1
-
-        if not sites:
-            break
-
-        if attempts:
-            query_notify.warning(
-                f'Restarting checks for {len(sites)} sites... ({attempts} attempts left)'
-            )
-
-    # closing http client session
-    await clearweb_checker.close()
-    await tor_checker.close()
-    await i2p_checker.close()
-
-    # notify caller that all queries are finished
-    query_notify.finish()
+    # if not options['silent']:
+    #     query_notify.bar.title = 'Finished'
 
     return all_results
 
-
-def timeout_check(value):
-    """Check Timeout Argument.
-
-    Checks timeout for validity.
-
-    Keyword Arguments:
-    value                  -- Time in seconds to wait before timing out request.
-
-    Return Value:
-    Floating point number representing the time (in seconds) that should be
-    used for the timeout.
-
-    NOTE:  Will raise an exception if the timeout in invalid.
-    """
-    from argparse import ArgumentTypeError
-
-    try:
-        timeout = float(value)
-    except ValueError:
-        raise ArgumentTypeError(f"Timeout '{value}' must be a number.")
-    if timeout <= 0:
-        raise ArgumentTypeError(f"Timeout '{value}' must be greater than 0.0s.")
-    return timeout
-
-
-async def site_self_check(
-    site: MaigretSite,
-    logger: logging.Logger,
-    semaphore,
-    db: MaigretDatabase,
-    silent=False,
-    proxy=None,
-    tor_proxy=None,
-    i2p_proxy=None,
-    skip_errors=False,
-    cookies=None,
-):
-    changes = {
-        "disabled": False,
-    }
-
-    check_data = [
-        (site.username_claimed, MaigretCheckStatus.CLAIMED),
-        (site.username_unclaimed, MaigretCheckStatus.AVAILABLE),
-    ]
-
-    logger.info(f"Checking {site.name}...")
-
-    for username, status in check_data:
-        async with semaphore:
-            results_dict = await maigret(
-                username=username,
-                site_dict={site.name: site},
-                logger=logger,
-                timeout=30,
-                id_type=site.type,
-                forced=True,
-                no_progressbar=True,
-                retries=1,
-                proxy=proxy,
-                tor_proxy=tor_proxy,
-                i2p_proxy=i2p_proxy,
-                cookies=cookies,
-            )
-
-            # don't disable entries with other ids types
-            # TODO: make normal checking
-            if site.name not in results_dict:
-                logger.info(results_dict)
-                changes["disabled"] = True
-                continue
-
-            logger.debug(results_dict)
-
-            result = results_dict[site.name]["status"]
-
-        if result.error and 'Cannot connect to host' in result.error.desc:
-            changes["disabled"] = True
-
-        site_status = result.status
-
-        if site_status != status:
-            if site_status == MaigretCheckStatus.UNKNOWN:
-                msgs = site.absence_strs
-                etype = site.check_type
-                logger.warning(
-                    f"Error while searching {username} in {site.name}: {result.context}, {msgs}, type {etype}"
-                )
-                # don't disable sites after the error
-                # meaning that the site could be available, but returned error for the check
-                # e.g. many sites protected by cloudflare and available in general
-                if skip_errors:
-                    pass
-                # don't disable in case of available username
-                elif status == MaigretCheckStatus.CLAIMED:
-                    changes["disabled"] = True
-            elif status == MaigretCheckStatus.CLAIMED:
-                logger.warning(
-                    f"Not found `{username}` in {site.name}, must be claimed"
-                )
-                logger.info(results_dict[site.name])
-                changes["disabled"] = True
-            else:
-                logger.warning(f"Found `{username}` in {site.name}, must be available")
-                logger.info(results_dict[site.name])
-                changes["disabled"] = True
-
-    logger.info(f"Site {site.name} checking is finished")
-
-    if changes["disabled"] != site.disabled:
-        site.disabled = changes["disabled"]
-        logger.info(f"Switching property 'disabled' for {site.name} to {site.disabled}")
-        db.update_site(site)
-        if not silent:
-            action = "Disabled" if site.disabled else "Enabled"
-            print(f"{action} site {site.name}...")
-
-    # remove service tag "unchecked"
-    if "unchecked" in site.tags:
-        site.tags.remove("unchecked")
-        db.update_site(site)
-
-    return changes
-
-
-async def self_check(
-    db: MaigretDatabase,
-    site_data: dict,
-    logger: logging.Logger,
-    silent=False,
-    max_connections=10,
-    proxy=None,
-    tor_proxy=None,
-    i2p_proxy=None,
-) -> bool:
-    sem = asyncio.Semaphore(max_connections)
-    tasks = []
-    all_sites = site_data
-
-    def disabled_count(lst):
-        return len(list(filter(lambda x: x.disabled, lst)))
-
-    unchecked_old_count = len(
-        [site for site in all_sites.values() if "unchecked" in site.tags]
-    )
-    disabled_old_count = disabled_count(all_sites.values())
-
-    for _, site in all_sites.items():
-        check_coro = site_self_check(
-            site, logger, sem, db, silent, proxy, tor_proxy, i2p_proxy, skip_errors=True
-        )
-        future = asyncio.ensure_future(check_coro)
-        tasks.append(future)
-
-    if tasks:
-        with alive_bar(len(tasks), title='Self-checking', force_tty=True) as progress:
-            for f in asyncio.as_completed(tasks):
-                await f
-                progress()  # Update the progress bar
-
-    unchecked_new_count = len(
-        [site for site in all_sites.values() if "unchecked" in site.tags]
-    )
-    disabled_new_count = disabled_count(all_sites.values())
-    total_disabled = disabled_new_count - disabled_old_count
-
-    if total_disabled:
-        if total_disabled >= 0:
-            message = "Disabled"
-        else:
-            message = "Enabled"
-            total_disabled *= -1
-
-        if not silent:
-            print(
-                f"{message} {total_disabled} ({disabled_old_count} => {disabled_new_count}) checked sites. "
-                "Run with `--info` flag to get more information"
-            )
-
-    if unchecked_new_count != unchecked_old_count:
-        print(f"Unchecked sites verified: {unchecked_old_count - unchecked_new_count}")
-
-    return total_disabled != 0 or unchecked_new_count != unchecked_old_count
-
-
-def extract_ids_data(html_text, logger, site) -> Dict:
-    try:
-        return extract(html_text)
-    except Exception as e:
-        logger.warning(f"Error while parsing {site.name}: {e}", exc_info=True)
-        return {}
-
-
-def parse_usernames(extracted_ids_data, logger) -> Dict:
-    new_usernames = {}
-    for k, v in extracted_ids_data.items():
-        if "username" in k and not "usernames" in k:
-            new_usernames[v] = "username"
-        elif "usernames" in k:
-            try:
-                tree = ast.literal_eval(v)
-                if type(tree) == list:
-                    for n in tree:
-                        new_usernames[n] = "username"
-            except Exception as e:
-                logger.warning(e)
-        if k in SUPPORTED_IDS:
-            new_usernames[v] = k
-    return new_usernames
-
-
-def update_results_info(results_info, extracted_ids_data, new_usernames):
-    results_info["ids_usernames"] = new_usernames
-    links = ascii_data_display(extracted_ids_data.get("links", "[]"))
-    if "website" in extracted_ids_data:
-        links.append(extracted_ids_data["website"])
-    results_info["ids_links"] = links
-    return results_info
+# ... (rest of the code remains the same)

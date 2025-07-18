@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from typing import Dict, Any
 
+import aiofiles
 import xmind
 from dateutil.tz import gettz
 from dateutil.parser import parse as parse_datetime_str
@@ -40,16 +41,19 @@ def filter_supposed_data(data):
     return filtered_supposed_data
 
 
+def _sort_key(x):
+    status = x[1].get('status')
+    if status:
+        return len(status.ids_data.keys())
+    return 0
+
+
 def sort_report_by_data_points(results):
-    return dict(
-        sorted(
-            results.items(),
-            key=lambda x: len(
-                (x[1].get('status') and x[1]['status'].ids_data or {}).keys()
-            ),
-            reverse=True,
-        )
-    )
+    return dict(sorted(results.items(), key=_sort_key, reverse=True))
+
+
+def _tuple_sort(d):
+    return sorted(d, key=lambda x: x[1], reverse=True)
 
 
 """
@@ -57,37 +61,46 @@ REPORTS SAVING
 """
 
 
-def save_csv_report(filename: str, username: str, results: dict):
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        generate_csv_report(username, results, f)
+async def save_csv_report(filename: str, username: str, results: dict):
+    buffer = io.StringIO()
+    generate_csv_report(username, results, buffer)
+    async with aiofiles.open(filename, "w", newline="", encoding="utf-8") as f:
+        await f.write(buffer.getvalue())
 
 
-def save_txt_report(filename: str, username: str, results: dict):
-    with open(filename, "w", encoding="utf-8") as f:
-        generate_txt_report(username, results, f)
+async def save_txt_report(filename: str, username: str, results: dict):
+    buffer = io.StringIO()
+    generate_txt_report(username, results, buffer)
+    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+        await f.write(buffer.getvalue())
 
 
-def save_html_report(filename: str, context: dict):
+async def save_html_report(filename: str, context: dict):
     template, _ = generate_report_template(is_pdf=False)
     filled_template = template.render(**context)
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(filled_template)
+    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+        await f.write(filled_template)
 
 
-def save_pdf_report(filename: str, context: dict):
+async def save_pdf_report(filename: str, context: dict):
     template, css = generate_report_template(is_pdf=True)
     filled_template = template.render(**context)
 
     # moved here to speed up the launch of Maigret
     from xhtml2pdf import pisa
 
-    with open(filename, "w+b") as f:
-        pisa.pisaDocument(io.StringIO(filled_template), dest=f, default_css=css)
+    buffer = io.BytesIO()
+    pisa.pisaDocument(io.StringIO(filled_template), dest=buffer, default_css=css)
+
+    async with aiofiles.open(filename, "w+b") as f:
+        await f.write(buffer.getvalue())
 
 
-def save_json_report(filename: str, username: str, results: dict, report_type: str):
-    with open(filename, "w", encoding="utf-8") as f:
-        generate_json_report(username, results, f, report_type=report_type)
+async def save_json_report(filename: str, username: str, results: dict, report_type: str):
+    buffer = io.StringIO()
+    generate_json_report(username, results, buffer, report_type=report_type)
+    async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+        await f.write(buffer.getvalue())
 
 
 class MaigretGraph:
@@ -396,7 +409,6 @@ def generate_report_context(username_results: list):
     brief_text.append(f"Extended info extracted from {extended_info_count} accounts.")
 
     brief = " ".join(brief_text).strip()
-    tuple_sort = lambda d: sorted(d, key=lambda x: x[1], reverse=True)
 
     if "global" in tags:
         # remove tag 'global' useless for country detection
@@ -414,8 +426,8 @@ def generate_report_context(username_results: list):
         "brief": brief,
         "results": username_results,
         "first_seen": first_seen,
-        "interests_tuple_list": tuple_sort(interests_list),
-        "countries_tuple_list": tuple_sort(countries_lists),
+        "interests_tuple_list": _tuple_sort(interests_list),
+        "countries_tuple_list": _tuple_sort(countries_lists),
         "supposed_data": filtered_supposed_data,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
@@ -494,13 +506,23 @@ XMIND 8 Functions
 """
 
 
-def save_xmind_report(filename, username, results):
+async def save_xmind_report(filename, username, results):
     if os.path.exists(filename):
         os.remove(filename)
-    workbook = xmind.load(filename)
+    # xmind library is synchronous, so we need to generate the report in memory
+    # and then write it to a file asynchronously.
+    workbook = xmind.load(os.path.join(os.path.dirname(__file__), 'resources', 'template.xmind'))
     sheet = workbook.getPrimarySheet()
     design_xmind_sheet(sheet, username, results)
-    xmind.save(workbook, path=filename)
+
+    # The save function of xmind can take a path or a file-like object.
+    # We'll use a BytesIO buffer to save it in memory first.
+    buffer = io.BytesIO()
+    xmind.save(workbook, buffer)
+    buffer.seek(0)
+
+    async with aiofiles.open(filename, 'wb') as f:
+        await f.write(buffer.read())
 
 
 def add_xmind_subtopic(userlink, k, v, supposed_data):

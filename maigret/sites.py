@@ -1,26 +1,32 @@
 # ****************************** -*-
+# -*- coding: utf-8 -*-
 """Maigret Sites Information"""
 import copy
 import json
 import sys
+import aiofiles
+import aiohttp
 from typing import Optional, List, Dict, Any, Tuple
 
 from .utils import CaseConverter, URLMatcher, is_country_tag
 
 
 class MaigretEngine:
+    """Class for a Maigret engine"""
     site: Dict[str, Any] = {}
 
     def __init__(self, name, data):
         self.name = name
-        self.__dict__.update(data)
+        self.site = data
 
     @property
     def json(self):
-        return self.__dict__
+        """Get engine data as a dictionary"""
+        return self.site
 
 
 class MaigretSite:
+    """Class for a Maigret site"""
     # Fields that should not be serialized when converting site to JSON
     NOT_SERIALIZABLE_FIELDS = [
         "name",
@@ -95,6 +101,17 @@ class MaigretSite:
 
     def __init__(self, name, information):
         self.name = name
+        # Set default for mutable fields
+        self.tags = []
+        self.headers = {}
+        self.errors = {}
+        self.activation = {}
+        self.get_params = {}
+        self.presense_strs = []
+        self.absence_strs = []
+        self.stats = {}
+        self.engine_data = {}
+        
         self.url_subpath = ""
 
         for k, v in information.items():
@@ -111,9 +128,9 @@ class MaigretSite:
 
     def __is_equal_by_url_or_name(self, url_or_name_str: str):
         lower_url_or_name_str = url_or_name_str.lower()
-        lower_url = self.url.lower()
+        lower_url = str(self.url).lower()
         lower_name = self.name.lower()
-        lower_url_main = self.url_main.lower()
+        lower_url_main = str(self.url_main).lower()
 
         return (
             lower_name == lower_url_or_name_str
@@ -150,7 +167,7 @@ class MaigretSite:
             ]
 
             return all(
-                getattr(self, attr) == getattr(other, attr) for attr in attrs_to_compare
+                getattr(self, attr, None) == getattr(other, attr, None) for attr in attrs_to_compare
             )
         elif isinstance(other, str):
             # Compare only by name (exactly) or url_main (partial similarity)
@@ -158,19 +175,22 @@ class MaigretSite:
         return False
 
     def update_detectors(self):
-        if "url" in self.__dict__:
+        """Update URL detectors"""
+        if "url" in self.__dict__ and isinstance(self.url, str):
             url = self.url
             for group in ["urlMain", "urlSubpath"]:
-                if group in url:
+                snake_group = CaseConverter.camel_to_snake(group)
+                if "{" + group + "}" in url:
                     url = url.replace(
                         "{" + group + "}",
-                        self.__dict__[CaseConverter.camel_to_snake(group)],
+                        self.__dict__.get(snake_group, ""),
                     )
 
             self.url_regexp = URLMatcher.make_profile_url_regexp(url, self.regex_check)
 
     def detect_username(self, url: str) -> Optional[str]:
-        if self.url_regexp:
+        """Detect username from a URL"""
+        if hasattr(self, "url_regexp") and self.url_regexp:
             match_groups = self.url_regexp.match(url)
             if match_groups:
                 return match_groups.groups()[-1].rstrip("/")
@@ -180,9 +200,8 @@ class MaigretSite:
     def extract_id_from_url(self, url: str) -> Optional[Tuple[str, str]]:
         """
         Extracts username from url.
-        It's outdated, detects only a format of https://example.com/{username}
         """
-        if not self.url_regexp:
+        if not hasattr(self, "url_regexp") or not self.url_regexp:
             return None
 
         match_groups = self.url_regexp.match(url)
@@ -196,12 +215,14 @@ class MaigretSite:
 
     @property
     def pretty_name(self):
+        """Get a pretty name for the site"""
         if self.source:
             return f"{self.name} [{self.source}]"
         return self.name
 
     @property
     def json(self):
+        """Get site data as a dictionary"""
         result = {}
         for k, v in self.__dict__.items():
             # convert to camelCase
@@ -217,6 +238,7 @@ class MaigretSite:
 
     @property
     def errors_dict(self) -> dict:
+        """Get a dictionary of errors"""
         errors: Dict[str, str] = {}
         if self.engine_obj:
             errors.update(self.engine_obj.site.get('errors', {}))
@@ -224,6 +246,7 @@ class MaigretSite:
         return errors
 
     def get_url_template(self) -> str:
+        """Get a template for the URL"""
         url = URLMatcher.extract_main_part(self.url)
         if url.startswith("{username}"):
             url = "SUBDOMAIN"
@@ -235,21 +258,22 @@ class MaigretSite:
         return url
 
     def update(self, updates: "dict") -> "MaigretSite":
+        """Update site data"""
         self.__dict__.update(updates)
         self.update_detectors()
 
         return self
 
     def update_from_engine(self, engine: MaigretEngine) -> "MaigretSite":
+        """Update site data from an engine"""
         engine_data = engine.site
         for k, v in engine_data.items():
             field = CaseConverter.camel_to_snake(k)
             if isinstance(v, dict):
-                # TODO: assertion of intersecting keys
                 # update dicts like errors
-                self.__dict__.get(field, {}).update(v)
+                self.__dict__.setdefault(field, {}).update(v)
             elif isinstance(v, list):
-                self.__dict__[field] = self.__dict__.get(field, []) + v
+                self.__dict__.setdefault(field, []).extend(v)
             else:
                 self.__dict__[field] = v
 
@@ -259,6 +283,7 @@ class MaigretSite:
         return self
 
     def strip_engine_data(self) -> "MaigretSite":
+        """Strip engine data from site"""
         if not self.engine_obj:
             return self
 
@@ -266,20 +291,20 @@ class MaigretSite:
         self.url_regexp = None
 
         self_copy = copy.deepcopy(self)
-        engine_data = self_copy.engine_obj and self_copy.engine_obj.site or {}
+        engine_data = self_copy.engine_obj.site if self_copy.engine_obj else {}
         site_data_keys = list(self_copy.__dict__.keys())
 
         for k in engine_data.keys():
             field = CaseConverter.camel_to_snake(k)
             is_exists = field in site_data_keys
             # remove dict keys
-            if isinstance(engine_data[k], dict) and is_exists:
+            if isinstance(engine_data.get(k), dict) and is_exists:
                 for f in engine_data[k].keys():
                     if f in self_copy.__dict__[field]:
                         del self_copy.__dict__[field][f]
                 continue
             # remove list items
-            if isinstance(engine_data[k], list) and is_exists:
+            if isinstance(engine_data.get(k), list) and is_exists:
                 for f in engine_data[k]:
                     if f in self_copy.__dict__[field]:
                         self_copy.__dict__[field].remove(f)
@@ -291,6 +316,7 @@ class MaigretSite:
 
 
 class MaigretDatabase:
+    """Class for the Maigret database"""
     def __init__(self):
         self._tags: list = []
         self._sites: list = []
@@ -298,13 +324,16 @@ class MaigretDatabase:
 
     @property
     def sites(self):
+        """Get the list of sites"""
         return self._sites
 
     @property
     def sites_dict(self):
+        """Get a dictionary of sites"""
         return {site.name: site for site in self._sites}
 
     def has_site(self, site: MaigretSite):
+        """Check if a site exists in the database"""
         for s in self._sites:
             if site == s:
                 return True
@@ -317,8 +346,8 @@ class MaigretDatabase:
         self,
         reverse=False,
         top=sys.maxsize,
-        tags=[],
-        names=[],
+        tags=None,
+        names=None,
         disabled=True,
         id_type="username",
     ):
@@ -336,6 +365,11 @@ class MaigretDatabase:
         Returns:
             dict: Dictionary of filtered and ranked sites, with site names as keys and MaigretSite objects as values
         """
+        if names is None:
+            names = []
+        if tags is None:
+            tags = []
+
         normalized_names = list(map(str.lower, names))
         normalized_tags = list(map(str.lower, tags))
 
@@ -344,7 +378,7 @@ class MaigretDatabase:
         is_engine_ok = (
             lambda x: isinstance(x.engine, str) and x.engine.lower() in normalized_tags
         )
-        is_tags_ok = lambda x: set(x.tags).intersection(set(normalized_tags))
+        is_tags_ok = lambda x: set(map(str.lower, x.tags)).intersection(set(normalized_tags))
         is_protocol_in_tags = lambda x: x.protocol and x.protocol in normalized_tags
         is_disabled_needed = lambda x: not x.disabled or (
             "disabled" in tags or disabled
@@ -375,22 +409,26 @@ class MaigretDatabase:
 
     @property
     def engines(self):
+        """Get the list of engines"""
         return self._engines
 
     @property
     def engines_dict(self):
+        """Get a dictionary of engines"""
         return {engine.name: engine for engine in self._engines}
 
     def update_site(self, site: MaigretSite) -> "MaigretDatabase":
-        for s in self._sites:
+        """Update a site in the database"""
+        for i, s in enumerate(self._sites):
             if s.name == site.name:
-                s = site
+                self._sites[i] = site
                 return self
 
         self._sites.append(site)
         return self
 
-    def save_to_file(self, filename: str) -> "MaigretDatabase":
+    async def save_to_file(self, filename: str) -> "MaigretDatabase":
+        """Save the database to a file"""
         if '://' in filename:
             return self
 
@@ -400,107 +438,69 @@ class MaigretDatabase:
             "tags": self._tags,
         }
 
-        json_data = json.dumps(db_data, indent=4)
+        json_data = json.dumps(db_data, indent=4, sort_keys=True)
 
-        with open(filename, "w") as f:
-            f.write(json_data)
+        async with aiofiles.open(filename, "w", encoding="utf-8") as f:
+            await f.write(json_data)
 
         return self
 
+    async def load_from_path(self, path: str) -> "MaigretDatabase":
+        """Load the database from a file path or URL"""
+        if '://' in path:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(path) as response:
+                    response.raise_for_status()
+                    json_data = await response.json()
+        else:
+            async with aiofiles.open(path, "r", encoding="utf-8") as f:
+                content = await f.read()
+                json_data = json.loads(content)
+
+        return self.load_from_json(json_data)
+
     def load_from_json(self, json_data: dict) -> "MaigretDatabase":
-        # Add all of site information from the json file to internal site list.
+        """Load the database from a dictionary"""
         site_data = json_data.get("sites", {})
         engines_data = json_data.get("engines", {})
         tags = json_data.get("tags", [])
 
-        self._tags += tags
+        self._tags.extend(t for t in tags if t not in self._tags)
 
-        for engine_name in engines_data:
-            self._engines.append(MaigretEngine(engine_name, engines_data[engine_name]))
+        for engine_name, engine_info in engines_data.items():
+            self._engines.append(MaigretEngine(engine_name, engine_info))
 
-        for site_name in site_data:
+        for site_name, site_info in site_data.items():
             try:
-                maigret_site = MaigretSite(site_name, site_data[site_name])
+                maigret_site = MaigretSite(site_name, site_info)
 
-                engine = site_data[site_name].get("engine")
-                if engine:
-                    maigret_site.update_from_engine(self.engines_dict[engine])
+                engine_name = site_info.get("engine")
+                if engine_name and engine_name in self.engines_dict:
+                    maigret_site.update_from_engine(self.engines_dict[engine_name])
 
-                self._sites.append(maigret_site)
+                self.update_site(maigret_site)
             except KeyError as error:
                 raise ValueError(
                     f"Problem parsing json content for site {site_name}: "
                     f"Missing attribute {str(error)}."
-                )
+                ) from error
 
         return self
 
     def load_from_str(self, db_str: "str") -> "MaigretDatabase":
+        """Load the database from a string"""
         try:
             data = json.loads(db_str)
-        except Exception as error:
+        except json.JSONDecodeError as error:
             raise ValueError(
                 f"Problem parsing json contents from str"
-                f"'{db_str[:50]}'...:  {str(error)}."
-            )
-
-        return self.load_from_json(data)
-
-    def load_from_path(self, path: str) -> "MaigretDatabase":
-        if '://' in path:
-            return self.load_from_http(path)
-        else:
-            return self.load_from_file(path)
-
-    def load_from_http(self, url: str) -> "MaigretDatabase":
-        is_url_valid = url.startswith("http://") or url.startswith("https://")
-
-        if not is_url_valid:
-            raise FileNotFoundError(f"Invalid data file URL '{url}'.")
-
-        import requests
-
-        try:
-            response = requests.get(url=url)
-        except Exception as error:
-            raise FileNotFoundError(
-                f"Problem while attempting to access "
-                f"data file URL '{url}':  "
-                f"{str(error)}"
-            )
-
-        if response.status_code == 200:
-            try:
-                data = response.json()
-            except Exception as error:
-                raise ValueError(
-                    f"Problem parsing json contents at " f"'{url}':  {str(error)}."
-                )
-        else:
-            raise FileNotFoundError(
-                f"Bad response while accessing " f"data file URL '{url}'."
-            )
-
-        return self.load_from_json(data)
-
-    def load_from_file(self, filename: "str") -> "MaigretDatabase":
-        try:
-            with open(filename, "r", encoding="utf-8") as file:
-                try:
-                    data = json.load(file)
-                except Exception as error:
-                    raise ValueError(
-                        f"Problem parsing json contents from "
-                        f"file '{filename}':  {str(error)}."
-                    )
-        except FileNotFoundError as error:
-            raise FileNotFoundError(
-                f"Problem while attempting to access " f"data file '{filename}'."
+                f"'{db_str[:50]}...':  {str(error)}."
             ) from error
 
         return self.load_from_json(data)
 
-    def get_scan_stats(self, sites_dict):
+    def get_scan_stats(self, sites_dict=None):
+        """Get scan statistics"""
         sites = sites_dict or self.sites_dict
         found_flags = {}
         for _, s in sites.items():
@@ -511,6 +511,7 @@ class MaigretDatabase:
         return found_flags
 
     def extract_ids_from_url(self, url: str) -> dict:
+        """Extract IDs from a URL"""
         results = {}
         for s in self._sites:
             result = s.extract_id_from_url(url)
@@ -521,25 +522,25 @@ class MaigretDatabase:
         return results
 
     def get_db_stats(self, is_markdown=False):
-        # Initialize counters
+        """Get database statistics"""
         sites_dict = self.sites_dict
+        total_count = len(sites_dict)
+        if total_count == 0:
+            return "Database is empty."
+
         urls = {}
         tags = {}
         disabled_count = 0
         message_checks_one_factor = 0
         status_checks = 0
 
-        # Collect statistics
         for site in sites_dict.values():
-            # Count disabled sites
             if site.disabled:
                 disabled_count += 1
 
-            # Count URL types
             url_type = site.get_url_template()
             urls[url_type] = urls.get(url_type, 0) + 1
 
-            # Count check types for enabled sites
             if not site.disabled:
                 if site.check_type == 'message':
                     if not (site.absence_strs and site.presense_strs):
@@ -547,33 +548,19 @@ class MaigretDatabase:
                 elif site.check_type == 'status_code':
                     status_checks += 1
 
-            # Count tags
             if not site.tags:
                 tags["NO_TAGS"] = tags.get("NO_TAGS", 0) + 1
             for tag in filter(lambda x: not is_country_tag(x), site.tags):
                 tags[tag] = tags.get(tag, 0) + 1
 
-        # Calculate percentages
-        total_count = len(sites_dict)
         enabled_count = total_count - disabled_count
         enabled_perc = round(100 * enabled_count / total_count, 2)
-        checks_perc = round(100 * message_checks_one_factor / enabled_count, 2)
-        status_checks_perc = round(100 * status_checks / enabled_count, 2)
+        checks_perc = round(100 * message_checks_one_factor / enabled_count, 2) if enabled_count else 0
+        status_checks_perc = round(100 * status_checks / enabled_count, 2) if enabled_count else 0
 
-        # Sites with probing and activation (kinda special cases, let's watch them)
-        site_with_probing = []
-        site_with_activation = []
-        for site in sites_dict.values():
+        site_with_probing = [f"{s.name}{' (disabled)' if s.disabled else ''}" for s in sites_dict.values() if s.url_probe]
+        site_with_activation = [f"{s.name}{' (disabled)' if s.disabled else ''}" for s in sites_dict.values() if s.activation]
 
-            def get_site_label(site):
-                return f"{site.name}{' (disabled)' if site.disabled else ''}"
-
-            if site.url_probe:
-                site_with_probing.append(get_site_label(site))
-            if site.activation:
-                site_with_activation.append(get_site_label(site))
-
-        # Format output
         separator = "\n\n"
         output = [
             f"Enabled/total sites: {enabled_count}/{total_count} = {enabled_perc}%",
@@ -592,20 +579,23 @@ class MaigretDatabase:
         self, title, items_dict, limit, is_markdown, valid_items=None
     ):
         """Helper method to format top items lists"""
+        if valid_items is None:
+            valid_items = []
+            
         output = f"Top {limit} {title}:\n"
-        for item, count in sorted(items_dict.items(), key=lambda x: x[1], reverse=True)[
-            :limit
-        ]:
-            if count == 1:
+        
+        sorted_items = sorted(items_dict.items(), key=lambda x: x[1], reverse=True)
+
+        for item, count in sorted_items[:limit]:
+            if count == 1 and len(sorted_items) > limit:
                 break
             mark = (
                 " (non-standard)"
-                if valid_items is not None and item not in valid_items
+                if valid_items and item not in valid_items and item != "NO_TAGS"
                 else ""
             )
-            output += (
-                f"- ({count})\t`{item}`{mark}\n"
-                if is_markdown
-                else f"{count}\t{item}{mark}\n"
-            )
+            if is_markdown:
+                output += f"- ({count})\t`{item}`{mark}\n"
+            else:
+                output += f"{count}\t{item}{mark}\n"
         return output

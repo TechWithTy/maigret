@@ -7,7 +7,7 @@ class Permute:
         self.separators = ["", "_", "-", "."]
         self.elements = elements
 
-    def gather(self, method: str = "strict" or "all") -> dict:
+    async def gather(self, method: str = "strict" or "all") -> dict:
         permutations_dict = {}
         for i in range(1, len(self.elements) + 1):
             for subset in permutations(self.elements, i):

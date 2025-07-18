@@ -1,6 +1,7 @@
 import os
 import os.path as path
 import json
+import aiofiles
 from typing import List
 
 SETTINGS_FILES_PATHS = [
@@ -51,7 +52,7 @@ class Settings:
     def __init__(self):
         pass
 
-    def load(self, paths=None):
+    async def load(self, paths=None):
         was_inited = False
 
         if not paths:
@@ -61,8 +62,9 @@ class Settings:
             data = {}
 
             try:
-                with open(filename, "r", encoding="utf-8") as file:
-                    data = json.load(file)
+                async with aiofiles.open(filename, "r", encoding="utf-8") as file:
+                    content = await file.read()
+                    data = json.loads(content)
             except FileNotFoundError:
                 # treast as a normal situation
                 pass
